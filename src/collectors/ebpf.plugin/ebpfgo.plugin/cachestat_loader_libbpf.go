@@ -71,7 +71,7 @@ func LoadCachestatLegacy(cfg CachestatLegacyConfig) (*CachestatLegacyHandle, err
 	if err != nil {
 		return nil, fmt.Errorf("kernel reject check: %w", err)
 	}
-	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), "ebpf-go.plugin"); err != nil {
+	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), true, "ebpf-go.plugin"); err != nil {
 		return nil, err
 	}
 
@@ -79,8 +79,9 @@ func LoadCachestatLegacy(cfg CachestatLegacyConfig) (*CachestatLegacyHandle, err
 	coreSupported := libbpfloader.SupportsCore()
 	if !coreSupported {
 		selector := SelectIndex(cfg.Kernels, cfg.IsRHF, cfg.KernelVersion)
-		if int(selector) > cachestatMaxBaseSelector {
-			selector = uint32(cachestatMaxBaseSelector)
+		maxBase := effectiveMaxBaseSelector(cachestatMaxBaseSelector, cfg.IsRHF, cfg.KernelVersion)
+		if int(selector) > maxBase {
+			selector = uint32(maxBase)
 		}
 		plan.ObjectPath = BuildObjectPathWithFlavor(cfg.PluginsDir, selector, "cachestat", false, cfg.IsRHF, ObjectFlavorBase)
 		plan.LoadMode = LoadLegacy

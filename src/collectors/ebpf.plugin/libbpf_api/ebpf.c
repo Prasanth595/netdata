@@ -5,6 +5,11 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <sys/utsname.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <string.h>
+#include <strings.h>
 
 #include "../ebpf.h"
 #include "libnetdata/libnetdata.h"
@@ -136,45 +141,181 @@ int ebpf_get_kernel_version()
  *
  * @return It returns RH release on success and -1 otherwise
  */
-int get_redhat_release()
+int ebpf_parse_redhat_release_version(const char *release)
 {
-    char buffer[VERSION_STRING_LEN + 1];
-    int major, minor;
-    FILE *fp = fopen("/etc/redhat-release", "r");
+    if (!release)
+        return -1;
 
-    if (fp) {
-        major = 0;
-        minor = -1;
-        size_t length = fread(buffer, sizeof(char), VERSION_STRING_LEN, fp);
-        if (length > 4) {
-            buffer[length] = '\0';
-            char *end = strchr(buffer, '.');
-            char *start;
-            if (end) {
-                *end = '\0';
+    while (isspace((unsigned char)*release))
+        release++;
 
-                if (end > buffer) {
-                    start = end - 1;
+    const char *version = strstr(release, "release");
+    if (!version)
+        return -1;
 
-                    major = strtol(start, NULL, 10);
-                    start = ++end;
+    size_t vendor_len = (size_t)(version - release);
+    int is_supported_vendor =
+        (vendor_len >= 7 && !strncmp(release, "Red Hat", 7)) ||
+        (vendor_len >= 6 && !strncmp(release, "CentOS", 6)) ||
+        (vendor_len >= 9 && !strncmp(release, "AlmaLinux", 9)) ||
+        (vendor_len >= 11 && !strncmp(release, "Rocky Linux", 11)) ||
+        (vendor_len >= 10 && !strncmp(release, "CloudLinux", 10));
+    if (!is_supported_vendor)
+        return -1;
 
-                    char *minor_end = strchr(start, ' ');
-                    if (minor_end) {
-                        *minor_end = '\0';
-                        minor = strtol(start, NULL, 10);
-                    } else {
-                        minor = -1;
+    version += strlen("release");
+    while (isspace((unsigned char)*version))
+        version++;
+
+    errno = 0;
+    char *end;
+    long major = strtol(version, &end, 10);
+    if (end == version || errno || major <= 0 || major > (INT_MAX - 255) / 256)
+        return -1;
+
+    long minor = 0;
+    if (*end == '.') {
+        const char *minor_start = end + 1;
+        errno = 0;
+        minor = strtol(minor_start, &end, 10);
+        if (end == minor_start || errno || minor < 0 || minor > 255)
+            return -1;
+    }
+
+    while (*end == '.') {
+        const char *suffix_start = end + 1;
+        errno = 0;
+        strtol(suffix_start, &end, 10);
+        if (end == suffix_start || errno)
+            return -1;
+    }
+
+    if (*end && !isspace((unsigned char)*end) && *end != '(')
+        return -1;
+
+    return (int)(major * 256 + minor);
+}
+
+static int ebpf_is_redhat_family_id(const char *value, size_t length)
+{
+    return (length == 4 && !strncasecmp(value, "rhel", length)) ||
+           (length == 6 && !strncasecmp(value, "centos", length)) ||
+           (length == 9 && !strncasecmp(value, "almalinux", length)) ||
+           (length == 5 && !strncasecmp(value, "rocky", length)) ||
+           (length == 10 && !strncasecmp(value, "cloudlinux", length));
+}
+
+int ebpf_parse_redhat_release_from_os_release(const char *contents)
+{
+    if (!contents)
+        return -1;
+
+    int is_rhel = 0;
+    int major = 0;
+    int minor = 0;
+
+    for (const char *line = contents; *line;) {
+        const char *line_end = strchr(line, '\n');
+        size_t length = line_end ? (size_t)(line_end - line) : strlen(line);
+        const char *value = NULL;
+        size_t value_length = 0;
+        if (length >= 3 && !memcmp(line, "ID=", 3)) {
+            value = line + 3;
+            value_length = length - 3;
+            while (value_length && isspace((unsigned char)value[value_length - 1]))
+                value_length--;
+            if (value_length >= 2 && ((*value == '"' && value[value_length - 1] == '"') ||
+                                      (*value == '\'' && value[value_length - 1] == '\''))) {
+                value++;
+                value_length -= 2;
+            }
+            if (ebpf_is_redhat_family_id(value, value_length))
+                is_rhel = 1;
+        } else if (length > 11 && !memcmp(line, "VERSION_ID=", 11)) {
+            char version[VERSION_STRING_LEN + 1];
+            value = line + 11;
+            value_length = length - 11;
+            while (value_length && isspace((unsigned char)value[value_length - 1]))
+                value_length--;
+            if (value_length >= 2 && ((*value == '"' && value[value_length - 1] == '"') ||
+                                      (*value == '\'' && value[value_length - 1] == '\''))) {
+                value++;
+                value_length -= 2;
+            }
+            if (value_length > VERSION_STRING_LEN)
+                goto next_line;
+            memcpy(version, value, value_length);
+            version[value_length] = '\0';
+            char *version_end;
+            errno = 0;
+            long parsed_major = strtol(version, &version_end, 10);
+            int parsed_minor_value = 0;
+            int valid_version = version_end != version && !errno && parsed_major > 0 &&
+                                parsed_major <= (INT_MAX - 255) / 256;
+            if (valid_version) {
+                if (*version_end == '.') {
+                    char *minor_start = version_end + 1;
+                    errno = 0;
+                    long parsed_minor = strtol(minor_start, &version_end, 10);
+                    valid_version = version_end != minor_start && !errno && parsed_minor >= 0 && parsed_minor <= 255;
+                    parsed_minor_value = (int)parsed_minor;
+                    while (*version_end == '.') {
+                        char *component_start = version_end + 1;
+                        errno = 0;
+                        strtol(component_start, &version_end, 10);
+                        if (version_end == component_start || errno) {
+                            valid_version = 0;
+                            break;
+                        }
                     }
                 }
+                if (*version_end)
+                    valid_version = 0;
+            }
+            if (valid_version) {
+                major = (int)parsed_major;
+                minor = parsed_minor_value;
             }
         }
 
-        fclose(fp);
-        return ((major * 256) + minor);
-    } else {
-        return -1;
+    next_line:
+        if (!line_end)
+            break;
+        line = line_end + 1;
     }
+
+    return is_rhel && major ? major * 256 + minor : -1;
+}
+
+static int ebpf_get_redhat_release_from_os_release(void)
+{
+    FILE *fp = fopen("/etc/os-release", "r");
+    if (!fp)
+        return -1;
+
+    char contents[VERSION_STRING_LEN * 4 + 1];
+    size_t length = fread(contents, 1, sizeof(contents) - 1, fp);
+    fclose(fp);
+    contents[length] = '\0';
+    return ebpf_parse_redhat_release_from_os_release(contents);
+}
+
+int get_redhat_release()
+{
+    char buffer[VERSION_STRING_LEN + 1];
+    FILE *fp = fopen("/etc/redhat-release", "r");
+    if (fp) {
+        size_t length = fread(buffer, sizeof(char), VERSION_STRING_LEN, fp);
+        fclose(fp);
+        if (length) {
+            buffer[length] = '\0';
+            int release = ebpf_parse_redhat_release_version(buffer);
+            if (release >= 0)
+                return release;
+        }
+    }
+
+    return ebpf_get_redhat_release_from_os_release();
 }
 
 /**
@@ -366,9 +507,18 @@ static char *ebpf_select_kernel_name(uint32_t selector)
         NETDATA_IDX_STR_V5_14,
         NETDATA_IDX_STR_V5_15,
         NETDATA_IDX_STR_V5_16,
-        NETDATA_IDX_STR_V6_8};
+        NETDATA_IDX_STR_V5_17,
+        NETDATA_IDX_STR_V6_8,
+        NETDATA_IDX_STR_V6_12,
+        NETDATA_IDX_STR_V7_0};
 
     return kernel_names[selector];
+}
+
+static int ebpf_is_rhel10_6_12_stream(int is_rhf, uint32_t kver)
+{
+    return is_rhf >= 10 * 256 && is_rhf < 11 * 256 && kver >= NETDATA_EBPF_KERNEL_6_12 &&
+           kver < (6 * 65536 + 13 * 256);
 }
 
 /**
@@ -384,6 +534,8 @@ static char *ebpf_select_kernel_name(uint32_t selector)
 static int ebpf_select_max_index(int is_rhf, uint32_t kver)
 {
     if (is_rhf > 0) { // Is Red Hat family
+        if (ebpf_is_rhel10_6_12_stream(is_rhf, kver))
+            return NETDATA_IDX_V6_12;
         if (kver >= NETDATA_EBPF_KERNEL_5_14)
             return NETDATA_IDX_V5_14;
         else if (kver >= NETDATA_EBPF_KERNEL_5_4 && kver < NETDATA_EBPF_KERNEL_5_5) // For Oracle Linux
@@ -391,8 +543,14 @@ static int ebpf_select_max_index(int is_rhf, uint32_t kver)
         else if (kver >= NETDATA_EBPF_KERNEL_4_11)
             return NETDATA_IDX_V4_18;
     } else { // Kernels from kernel.org
-        if (kver >= NETDATA_EBPF_KERNEL_6_8)
+        if (kver >= NETDATA_EBPF_KERNEL_7_0)
+            return NETDATA_IDX_V7_0;
+        else if (kver >= NETDATA_EBPF_KERNEL_6_12)
+            return NETDATA_IDX_V6_12;
+        else if (kver >= NETDATA_EBPF_KERNEL_6_8)
             return NETDATA_IDX_V6_8;
+        else if (kver >= NETDATA_EBPF_KERNEL_5_17)
+            return NETDATA_IDX_V5_17;
         else if (kver >= NETDATA_EBPF_KERNEL_5_16)
             return NETDATA_IDX_V5_16;
         else if (kver >= NETDATA_EBPF_KERNEL_5_15)
@@ -421,12 +579,12 @@ static int ebpf_select_max_index(int is_rhf, uint32_t kver)
  * @param is_rhf  is Red Hat fammily?
  * param  kver    the kernel version
  */
-static uint32_t ebpf_select_index(uint32_t kernels, int is_rhf, uint32_t kver)
+uint32_t ebpf_select_index(uint32_t kernels, int is_rhf, uint32_t kver)
 {
     uint32_t start = ebpf_select_max_index(is_rhf, kver);
     uint32_t idx;
 
-    if (is_rhf == -1)
+    if (is_rhf <= 0)
         kernels &= ~NETDATA_V5_14;
 
     for (idx = start; idx; idx--) {
@@ -435,6 +593,29 @@ static uint32_t ebpf_select_index(uint32_t kernels, int is_rhf, uint32_t kver)
     }
 
     return idx;
+}
+
+uint32_t ebpf_select_disk_index(uint32_t kernels, int is_rhf, uint32_t kver)
+{
+    if (ebpf_is_rhel10_6_12_stream(is_rhf, kver))
+        return NETDATA_IDX_V6_12;
+    return ebpf_select_index(kernels, is_rhf, kver);
+}
+
+uint32_t ebpf_select_module_index(const ebpf_module_t *em, int is_rhf, uint32_t kver)
+{
+    uint64_t kernels = ebpf_is_rhel10_6_12_stream(is_rhf, kver) ? em->rhel10_kernels : em->kernels;
+
+    return !strcmp(em->info.thread_name, "disk") ? ebpf_select_disk_index(kernels, is_rhf, kver)
+                                                   : ebpf_select_index(kernels, is_rhf, kver);
+}
+
+int ebpf_legacy_disk_supported(int is_rhf, uint32_t kver)
+{
+    if (is_rhf <= 0 || kver < NETDATA_EBPF_KERNEL_5_17)
+        return 1;
+
+    return ebpf_is_rhel10_6_12_stream(is_rhf, kver);
 }
 
 /**
@@ -471,7 +652,7 @@ ebpf_mount_name(char *out, size_t len, char *path, uint32_t kver, const char *na
         (is_return) ? 'r' : 'p',
         name,
         version,
-        (is_rhf != -1) ? ".rhf" : "");
+        (is_rhf > 0) ? ".rhf" : "");
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -955,8 +1136,7 @@ static void ebpf_update_legacy_controller(ebpf_module_t *em, struct bpf_object *
 struct bpf_link **ebpf_load_program(char *plugins_dir, ebpf_module_t *em, int kver, int is_rhf, struct bpf_object **obj)
 {
     char lpath[4096];
-
-    uint32_t idx = ebpf_select_index(em->kernels, is_rhf, kver);
+    uint32_t idx = ebpf_select_module_index(em, is_rhf, kver);
 
     ebpf_mount_name(lpath, 4095, plugins_dir, idx, em->info.thread_name, em->mode, is_rhf);
 
@@ -965,6 +1145,11 @@ struct bpf_link **ebpf_load_program(char *plugins_dir, ebpf_module_t *em, int kv
     em->load |= EBPF_LOAD_LEGACY;
 
     *obj = bpf_object__open_file(lpath, NULL);
+    if ((!*obj || libbpf_get_error(*obj)) && is_rhf > 0 && !ebpf_is_rhel10_6_12_stream(is_rhf, kver)) {
+        *obj = NULL;
+        ebpf_mount_name(lpath, sizeof(lpath), plugins_dir, idx, em->info.thread_name, em->mode, -1);
+        *obj = bpf_object__open_file(lpath, NULL);
+    }
     // A failed open leaves nothing to close: libbpf 1.x returns NULL, older versions an error pointer.
     if (!*obj || libbpf_get_error(*obj)) {
         *obj = NULL;
@@ -1321,7 +1506,7 @@ static netdata_ebpf_load_mode_t ebpf_select_load_mode(
 #ifdef LIBBPF_MAJOR_VERSION
     if ((load & EBPF_LOAD_CORE) || (load & EBPF_LOAD_PLAY_DICE)) {
         // Quick fix for Oracle linux 8.x
-        load = (!btf_file || (is_rh && (kver >= NETDATA_EBPF_KERNEL_5_4 && kver < NETDATA_EBPF_KERNEL_5_5))) ?
+        load = (!btf_file || (is_rh > 0 && (kver >= NETDATA_EBPF_KERNEL_5_4 && kver < NETDATA_EBPF_KERNEL_5_5))) ?
                    EBPF_LOAD_LEGACY :
                    EBPF_LOAD_CORE;
     }

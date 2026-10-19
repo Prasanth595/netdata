@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,8 +16,12 @@ const (
 	minimumKernelVersion       = 4<<16 + 11<<8
 	minimumKernelVersionBuffer = 5<<16 + 10<<8
 	minimumKernelVersionArena  = 6<<16 + 12<<8
+	maximumKernelVersionArena  = 6<<16 + 13<<8
+	minimumKernelVersionSeven  = 7 << 16
 	minimumRHVersion           = 7*256 + 5
 )
+
+var errNotRedHatFamily = errors.New("host is not a recognized Red Hat-family distribution")
 
 type LoadMethod uint32
 
@@ -83,7 +89,7 @@ const (
 )
 
 var kernelReleaseRe = regexp.MustCompile(`^([0-9]+)\.([0-9]+)\.([0-9]+)`)
-var redHatReleaseRe = regexp.MustCompile(`([0-9]+)\.([0-9]+)`)
+var redHatReleaseRe = regexp.MustCompile(`(?i)^\s*(red hat|centos|almalinux|rocky linux|cloudlinux).*?release[[:space:]]+([0-9]+)(\.([0-9]+))?`)
 
 func KernelVersionFromRelease(release string) (uint32, error) {
 	release = strings.TrimSpace(release)
@@ -125,18 +131,21 @@ func KernelVersion() (uint32, error) {
 func RedHatReleaseFromFile(contents string) (int, error) {
 	contents = strings.TrimSpace(contents)
 	match := redHatReleaseRe.FindStringSubmatch(contents)
-	if len(match) != 3 {
+	if len(match) != 5 {
 		return -1, fmt.Errorf("invalid redhat release %q", contents)
 	}
 
-	major, err := strconv.Atoi(match[1])
+	major, err := strconv.Atoi(match[2])
 	if err != nil {
 		return -1, fmt.Errorf("parse redhat major from %q: %w", contents, err)
 	}
 
-	minor, err := strconv.Atoi(match[2])
-	if err != nil {
-		return -1, fmt.Errorf("parse redhat minor from %q: %w", contents, err)
+	minor := 0
+	if match[4] != "" {
+		minor, err = strconv.Atoi(match[4])
+		if err != nil {
+			return -1, fmt.Errorf("parse redhat minor from %q: %w", contents, err)
+		}
 	}
 
 	return major*256 + minor, nil
@@ -144,11 +153,78 @@ func RedHatReleaseFromFile(contents string) (int, error) {
 
 func RedHatRelease() (int, error) {
 	contents, err := os.ReadFile("/etc/redhat-release")
-	if err != nil {
-		return -1, err
+	if err == nil {
+		if version, parseErr := RedHatReleaseFromFile(string(contents)); parseErr == nil {
+			return version, nil
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		redHatErr := fmt.Errorf("unable to read /etc/redhat-release: %w", err)
+		contents, osReleaseErr := os.ReadFile("/etc/os-release")
+		return redHatReleaseFromUnreadableFile(redHatErr, string(contents), osReleaseErr)
 	}
 
-	return RedHatReleaseFromFile(string(contents))
+	contents, err = os.ReadFile("/etc/os-release")
+	if err != nil {
+		return -1, fmt.Errorf("unable to read Red Hat release metadata: %w", err)
+	}
+	if version := RedHatReleaseFromOSRelease(string(contents)); version >= 0 {
+		return version, nil
+	}
+	return -1, errNotRedHatFamily
+}
+
+func redHatReleaseFromUnreadableFile(redHatErr error, osRelease string, osReleaseErr error) (int, error) {
+	if osReleaseErr != nil {
+		// Keep the primary read error discoverable; a secondary ENOENT would hide it from errors.Is callers.
+		return -1, fmt.Errorf("%w (also unable to read /etc/os-release: %v)", redHatErr, osReleaseErr)
+	}
+	if version := RedHatReleaseFromOSRelease(osRelease); version >= 0 {
+		return version, nil
+	}
+	return -1, redHatErr
+}
+
+func RedHatReleaseFromOSRelease(contents string) int {
+	var major, minor int
+	isRHEL := false
+	for _, line := range strings.Split(contents, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, "\"'")
+		switch key {
+		case "ID":
+			switch strings.ToLower(value) {
+			case "rhel", "centos", "almalinux", "rocky", "cloudlinux":
+				isRHEL = true
+			}
+		case "VERSION_ID":
+			parts := strings.Split(value, ".")
+			parsedMajor, err := strconv.Atoi(parts[0])
+			if err != nil || parsedMajor <= 0 {
+				return -1
+			}
+			major = parsedMajor
+			if len(parts) >= 2 {
+				parsedMinor, err := strconv.Atoi(parts[1])
+				if err != nil || parsedMinor < 0 || parsedMinor > 255 {
+					return -1
+				}
+				minor = parsedMinor
+				for _, suffix := range parts[2:] {
+					if _, err := strconv.Atoi(suffix); err != nil {
+						return -1
+					}
+				}
+			}
+		}
+	}
+	if isRHEL && major > 0 && major <= (int(^uint(0)>>1)-255)/256 {
+		return major*256 + minor
+	}
+	return -1
 }
 
 // KernelVersionString returns a version string suitable for reject-list prefix
@@ -246,7 +322,13 @@ func KernelSupported(version uint32, rhVersion int, rejected bool) bool {
 	return version >= minimumKernelVersion || rhVersion >= minimumRHVersion
 }
 
-func CanLoadCode(version uint32, rhVersion int, rejected bool, isRoot bool, pluginName string) error {
+func CanLoadCode(version uint32, rhVersion int, rejected bool, isRoot bool, requireKprobes bool, pluginName string) error {
+	if rejected {
+		return fmt.Errorf("the current collector cannot run on this rejected kernel")
+	}
+	if err := kernelEBPFFeatureError(currentKernelEBPFFeatures(), requireKprobes); err != nil {
+		return err
+	}
 	if !KernelSupported(version, rhVersion, rejected) {
 		return fmt.Errorf("the current collector cannot run on this kernel")
 	}
@@ -276,6 +358,7 @@ func SelectKernelName(selector uint32) string {
 		"5.16",
 		"6.8",
 		"6.12",
+		"7.0",
 	}
 
 	if selector >= uint32(len(kernelNames)) {
@@ -285,9 +368,16 @@ func SelectKernelName(selector uint32) string {
 	return kernelNames[selector]
 }
 
+func isRHEL10Kernel612Stream(isRHF int, kver uint32) bool {
+	return isRHF >= 10*256 && isRHF < 11*256 &&
+		kver >= minimumKernelVersionArena && kver < maximumKernelVersionArena
+}
+
 func SelectMaxIndex(isRHF int, kver uint32) int {
 	if isRHF > 0 {
 		switch {
+		case isRHEL10Kernel612Stream(isRHF, kver):
+			return 11
 		case kver >= 331264:
 			return 7
 		case kver >= 328704 && kver < 328960:
@@ -300,6 +390,8 @@ func SelectMaxIndex(isRHF int, kver uint32) int {
 	}
 
 	switch {
+	case kver >= minimumKernelVersionSeven:
+		return 12
 	case kver >= minimumKernelVersionArena:
 		return 11
 	case kver >= 395264:
@@ -336,6 +428,13 @@ func SelectIndex(kernels uint32, isRHF int, kver uint32) uint32 {
 	}
 
 	return 0
+}
+
+func effectiveMaxBaseSelector(maxBaseSelector, isRHF int, kver uint32) int {
+	if isRHEL10Kernel612Stream(isRHF, kver) {
+		return 11
+	}
+	return maxBaseSelector
 }
 
 func BuildObjectPath(pluginsDir string, selector uint32, name string, isReturn bool, isRHF int) string {
@@ -491,14 +590,16 @@ func resolveKernelAndRH() (kver uint32, isRHF int, err error) {
 	isRHF = -1
 	if rhf, rherr := RedHatRelease(); rherr == nil {
 		isRHF = rhf
-	} else if !os.IsNotExist(rherr) {
-		// File present but unreadable — log once so the operator knows why
-		// RHEL-specific object paths and kernel indices will not be used.
+	} else if shouldWarnRedHatDetectionError(rherr) {
 		fmt.Fprintf(os.Stderr,
-			"ebpf-go.plugin: warning: /etc/redhat-release unreadable (%v); treating host as non-RHEL\n",
+			"ebpf-go.plugin: warning: unable to determine Red Hat-family release metadata (%v); treating host as non-RHEL\n",
 			rherr)
 	}
 	return kver, isRHF, nil
+}
+
+func shouldWarnRedHatDetectionError(err error) bool {
+	return err != nil && !errors.Is(err, errNotRedHatFamily) && !errors.Is(err, fs.ErrNotExist)
 }
 
 // kprobePlanRequest carries the inputs shared by kprobe/trampoline-based
@@ -526,8 +627,9 @@ func buildKprobeLegacyPlan(req kprobePlanRequest) LoadPlan {
 	selector := SelectIndex(req.Kernels, req.IsRHF, req.KernelVersion)
 	// Base-flavor objects are not built for every kernel the buffer/arena objects
 	// cover.  Cap the selector so we never construct a path that does not exist.
-	if flavor == ObjectFlavorBase && req.MaxBaseSelector > 0 && int(selector) > req.MaxBaseSelector {
-		selector = uint32(req.MaxBaseSelector)
+	baseMax := effectiveMaxBaseSelector(req.MaxBaseSelector, req.IsRHF, req.KernelVersion)
+	if flavor == ObjectFlavorBase && baseMax > 0 && int(selector) > baseMax {
+		selector = uint32(baseMax)
 	}
 	return LoadPlan{
 		KernelVersion: req.KernelVersion,
@@ -548,10 +650,11 @@ func buildKprobeLegacyPlan(req kprobePlanRequest) LoadPlan {
 // maxBaseSelector is the highest selector index for which base-flavor objects
 // exist for this module; pass 0 to disable the cap.
 func buildFallbackPlans(primary LoadPlan, pluginsDir string, isRHF int, name string, maxBaseSelector int) []LoadPlan {
+	maxBaseSelector = effectiveMaxBaseSelector(maxBaseSelector, isRHF, primary.KernelVersion)
 	plans := make([]LoadPlan, 0, 6)
 	addPlan := func(plan LoadPlan) {
 		plans = append(plans, plan)
-		if isRHF == -1 {
+		if isRHF == -1 || isRHEL10Kernel612Stream(isRHF, primary.KernelVersion) {
 			return
 		}
 

@@ -52,7 +52,7 @@ func LoadSocketLegacy(cfg SocketLegacyConfig) (*SocketLegacyHandle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernel reject check: %w", err)
 	}
-	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), "ebpf-go.plugin"); err != nil {
+	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), true, "ebpf-go.plugin"); err != nil {
 		return nil, err
 	}
 
@@ -60,8 +60,9 @@ func LoadSocketLegacy(cfg SocketLegacyConfig) (*SocketLegacyHandle, error) {
 	coreSupported := libbpfloader.SupportsCore()
 	if !coreSupported {
 		selector := SelectIndex(cfg.Kernels, cfg.IsRHF, cfg.KernelVersion)
-		if int(selector) > socketMaxBaseSelector {
-			selector = uint32(socketMaxBaseSelector)
+		maxBase := effectiveMaxBaseSelector(socketMaxBaseSelector, cfg.IsRHF, cfg.KernelVersion)
+		if int(selector) > maxBase {
+			selector = uint32(maxBase)
 		}
 		plan = LoadPlan{
 			KernelVersion: cfg.KernelVersion,

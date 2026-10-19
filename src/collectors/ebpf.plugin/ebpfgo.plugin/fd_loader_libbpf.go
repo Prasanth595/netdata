@@ -81,15 +81,16 @@ func LoadFDLegacy(cfg FDLegacyConfig) (*FDLegacyHandle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernel reject check: %w", err)
 	}
-	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), "ebpf-go.plugin"); err != nil {
+	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), true, "ebpf-go.plugin"); err != nil {
 		return nil, err
 	}
 
 	plan := BuildFDLegacyPlan(cfg)
 	if !libbpfloader.FDSupportsCore() {
 		selector := SelectIndex(cfg.Kernels, cfg.IsRHF, cfg.KernelVersion)
-		if int(selector) > fdMaxBaseSelector {
-			selector = uint32(fdMaxBaseSelector)
+		maxBase := effectiveMaxBaseSelector(fdMaxBaseSelector, cfg.IsRHF, cfg.KernelVersion)
+		if int(selector) > maxBase {
+			selector = uint32(maxBase)
 		}
 		plan.ObjectPath = BuildObjectPathWithFlavor(
 			cfg.PluginsDir, selector, "fd", plan.IsReturn, cfg.IsRHF, ObjectFlavorBase)

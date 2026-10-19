@@ -67,15 +67,16 @@ func LoadDCStatLegacy(cfg DCStatLegacyConfig) (*DCStatLegacyHandle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernel reject check: %w", err)
 	}
-	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), "ebpf-go.plugin"); err != nil {
+	if err := CanLoadCode(cfg.KernelVersion, cfg.IsRHF, rejected, IsRoot(), true, "ebpf-go.plugin"); err != nil {
 		return nil, err
 	}
 
 	plan := BuildDCStatLegacyPlan(cfg)
 	if !libbpfloader.DCStatSupportsCore() {
 		selector := SelectIndex(cfg.Kernels, cfg.IsRHF, cfg.KernelVersion)
-		if int(selector) > dcstatMaxBaseSelector {
-			selector = uint32(dcstatMaxBaseSelector)
+		maxBase := effectiveMaxBaseSelector(dcstatMaxBaseSelector, cfg.IsRHF, cfg.KernelVersion)
+		if int(selector) > maxBase {
+			selector = uint32(maxBase)
 		}
 		plan.ObjectPath = BuildObjectPathWithFlavor(cfg.PluginsDir, selector, "dc", false, cfg.IsRHF, ObjectFlavorBase)
 		plan.LoadMode = LoadLegacy
